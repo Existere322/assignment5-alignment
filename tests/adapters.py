@@ -1,4 +1,5 @@
 from __future__ import annotations
+from cs336_alignment.grpo import tokenize_prompt_and_output
 
 import os
 from typing import Any, Callable, Literal
@@ -46,7 +47,9 @@ def run_tokenize_prompt_and_output(
                 with labels, with value 1 where the corresponding label token
                 is part of the response and 0 otherwise.
     """
-    raise NotImplementedError
+    return tokenize_prompt_and_output(
+        prompt_strs, output_strs, tokenizer
+    )
 
 
 def run_get_response_log_probs(
