@@ -1,6 +1,6 @@
 from __future__ import annotations
 from cs336_alignment.grpo import tokenize_prompt_and_output, get_response_log_probs, compute_rollout_rewards
-
+from cs336_alignment.grpo import compute_group_normalized_rewards, compute_policy_gradient_loss, aggregate_loss_across_microbatch
 import os
 from typing import Any, Callable, Literal
 
@@ -160,7 +160,9 @@ def run_compute_group_normalized_rewards(
                 your choice of other statistics to log (e.g. mean, std, max/min
                 of rewards).
     """
-    raise NotImplementedError
+    return compute_group_normalized_rewards(
+        raw_rewards, group_size, baseline, advantage_eps, advantage_normalizer
+    )
 
 
 def run_compute_policy_gradient_loss(
@@ -207,7 +209,9 @@ def run_compute_policy_gradient_loss(
                 Statistics from the underlying loss call, such as
                 clip-fraction components.
     """
-    raise NotImplementedError
+    return compute_policy_gradient_loss(
+        raw_rewards_or_advantages, policy_log_probs, importance_reweighting_method, old_log_probs, cliprange, response_mask
+    )
 
 
 def run_aggregate_loss_across_microbatch(
@@ -239,7 +243,9 @@ def run_aggregate_loss_across_microbatch(
             A scalar containing the average loss. Make sure you can later call
             backward on this loss.
     """
-    raise NotImplementedError
+    return aggregate_loss_across_microbatch(
+        per_token_policy_gradient_loss, mask, loss_normalization, normalization_constant
+    )
 
 
 def run_grpo_train_step(

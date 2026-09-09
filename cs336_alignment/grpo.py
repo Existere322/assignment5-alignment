@@ -2,6 +2,9 @@ import torch
 from transformers import PreTrainedTokenizer, PreTrainedModel
 import torch.nn.functional as F
 from collections.abc import Callable
+from typing import Literal
+from einops import rearrange
+
 
 def tokenize_prompt_and_output(
         prompt_strs: list[str], 
@@ -120,8 +123,70 @@ def compute_rollout_rewards(
     })
 
 
+def compute_group_normalized_rewards(
+    raw_rewards: torch.Tensor,  
+    group_size: int, 
+    baseline: Literal["mean", "none"] = "mean", 
+    advantage_eps: float = 1e-6, 
+    advantage_normalizer: Literal["std", "none", "mean"] = "std", 
+):
+    # rollout_batch_size = n_prompts_per_rollout_batch * group_size
+    if baseline != "mean":
+        raise NotImplementedError
+    if advantage_normalizer != "std":
+        raise NotImplementedError
+
+    grouped_rewards = rearrange(
+        raw_rewards,
+        "(num_groups group_size) -> num_groups group_size",
+        group_size=group_size,
+    )
+
+    group_mean = grouped_rewards.mean(-1, keepdim=True)
+    group_std = grouped_rewards.std(-1, correction=1, keepdim=True)
+    max_rewards = torch.max(raw_rewards, dim=-1)
+    min_rewards = torch.min(raw_rewards, dim=-1)
+
+    normalized_rewards = (grouped_rewards - group_mean) / (group_std + advantage_eps)
+
+    result = rearrange(normalized_rewards, "n g -> (n g)")
+
+    return (result, {"metadata":{"group_mean": group_mean, "group_std": group_std, "group_max": max_rewards, "group_min": min_rewards}})
+
+    
+def compute_policy_gradient_loss(
+    raw_rewards_or_advantages: torch.Tensor, 
+    policy_log_probs: torch.Tensor, 
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none", 
+    old_log_probs: torch.Tensor | None = None, 
+    cliprange: float | None = None, 
+    response_mask: torch.Tensor | None = None, 
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # raw_rewards_or_advantages: Shape (batch_size,) or (batch_size, 1)
+    # policy_log_probs: (batch_size, sequence_length)
+    if importance_reweighting_method != "none":
+        raise NotImplementedError
+
+    advantages = raw_rewards_or_advantages.unsqueeze(-1) if raw_rewards_or_advantages.ndim == 1 else raw_rewards_or_advantages
+    per_token_policy_loss = -(advantages * policy_log_probs)
+
+    return (per_token_policy_loss, {})
 
 
+def aggregate_loss_across_microbatch(
+    per_token_policy_gradient_loss: torch.Tensor, 
+    mask: torch.Tensor, 
+    loss_normalization : Literal["sequence", "constant"] = "sequence", 
+    normalization_constant: int | None = None, 
+) -> torch.Tensor:
+    # per_token_policy_gradient_loss: batch_size, sequence_length
+    # mask: batch_size, sequence_length
+    sequence_lengths = mask.sum(dim=-1)
+    masked_per_token_loss = per_token_policy_gradient_loss.masked_fill(~mask, 0)
+    if loss_normalization == "sequence":
+        total_loss = torch.mean(torch.sum(masked_per_token_loss, dim=-1) / sequence_lengths, dim=-1)
+    if loss_normalization == "constant":
+        total_loss = torch.sum(torch.sum(per_token_policy_gradient_loss, dim=-1), dim=-1)
+        total_loss = total_loss / normalization_constant
 
-
-
+    return total_loss
