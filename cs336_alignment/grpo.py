@@ -4,12 +4,13 @@ import torch.nn.functional as F
 from collections.abc import Callable
 from typing import Literal
 from einops import rearrange
+from torch.optim import Optimizer
 
 
 def tokenize_prompt_and_output(
-        prompt_strs: list[str], 
-        output_strs: list[str], 
-        tokenizer: PreTrainedTokenizer, 
+    prompt_strs: list[str], 
+    output_strs: list[str], 
+    tokenizer: PreTrainedTokenizer, 
 ) -> dict[str, torch.Tensor]:
     sequence_tokens = []
     sequence_masks = []
@@ -190,3 +191,134 @@ def aggregate_loss_across_microbatch(
         total_loss = total_loss / normalization_constant
 
     return total_loss
+
+
+def grpo_train_step(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    optimizer: Optimizer,
+    gradient_accumulation_steps: int,
+    max_grad_norm: float | None,
+    reward_fn: Callable[[str, str], dict[str, float]],
+    repeated_prompts: list[str],
+    rollout_responses: list[str],
+    repeated_ground_truths: list[str],
+    group_size: int, 
+    # Reward normalization
+    baseline: Literal["mean", "none"] = "mean",
+    advantage_eps: float = 1e-6,
+    advantage_normalizer: Literal["std", "none", "mean"] = "std",
+    # Importance reweighting and clipping
+    importance_reweighting_method: Literal["none", "noclip", "grpo", "gspo"] = "none",
+    old_log_probs: torch.Tensor | None = None,
+    cliprange: float | None = None,
+    # Loss normalization 
+    loss_normalization: Literal["sequence", "constant"] = "sequence",
+    normalization_constant: int | None = None,
+)-> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+
+    if importance_reweighting_method != "none":
+        raise NotImplementedError
+
+    if loss_normalization != "sequence":
+        raise NotImplementedError
+
+    tokenizer_response = tokenize_prompt_and_output(
+        prompt_strs=repeated_prompts, 
+        output_strs=rollout_responses, 
+        tokenizer=tokenizer
+    )
+
+    rollout_rewards = compute_rollout_rewards(
+        reward_fn=reward_fn, 
+        rollout_responses=rollout_responses, 
+        repeated_ground_truths=repeated_ground_truths
+    )
+    raw_rewards = rollout_rewards[0]
+    mean_rewards = rollout_rewards[1]["mean total rewards"]
+    mean_formal_rewards = rollout_rewards[1]["mean total format rewards"]
+
+
+    input_ids = tokenizer_response["input_ids"]
+    labels = tokenizer_response["labels"]
+    mask = tokenizer_response["response_mask"]
+
+    # Parameters to return or log
+    total_loss = []
+    entropy_sum = 0
+    valid_token_count = 0
+
+    microbatch_size = len(input_ids) // gradient_accumulation_steps
+
+    for i in range(0, len(input_ids), microbatch_size):
+        inputs_microbatch = input_ids[i:i+microbatch_size]
+        labels_microbatch = labels[i:i+microbatch_size]
+        rewards_microbatch = raw_rewards[i:i+microbatch_size]
+        masks = mask[i:i+microbatch_size]
+
+        response_log_probs = get_response_log_probs(
+            model=model, 
+            input_ids = inputs_microbatch, 
+            labels = labels_microbatch, 
+            return_token_entropy=True
+        )
+        log_probs = response_log_probs["log_probs"]
+
+        per_token_entropy = response_log_probs["token_entropy"]
+        entropy_sum += (
+            per_token_entropy.masked_fill(~masks, 0.0).sum().detach()
+        )
+        valid_token_count += masks.sum().detach()
+
+
+        group_normalized_rewards = compute_group_normalized_rewards(
+            raw_rewards=rewards_microbatch, 
+            group_size=group_size, 
+            baseline=baseline, 
+            advantage_eps=advantage_eps, 
+            advantage_normalizer=advantage_normalizer
+        )
+        group_normalized_rewards = group_normalized_rewards[0]
+
+        policy_gradient_loss = compute_policy_gradient_loss(
+            raw_rewards_or_advantages=group_normalized_rewards, 
+            policy_log_probs=log_probs, 
+            importance_reweighting_method=importance_reweighting_method
+        )
+        per_token_policy_loss = policy_gradient_loss[0]
+
+        aggregated_loss = aggregate_loss_across_microbatch(
+            per_token_policy_gradient_loss=per_token_policy_loss, 
+            mask=masks, 
+            loss_normalization=loss_normalization, 
+            normalization_constant=normalization_constant
+        ) * (len(inputs_microbatch) / len(input_ids))
+        aggregated_loss.backward()
+        total_loss.append(aggregated_loss.detach())
+        # detach 创建一个与原 Tensor 共享数值、但脱离 autograd 计算图的 Tensor
+
+    # 对累积梯度进行裁剪而不是在每个 microbatch 上进行裁剪
+    grad_norm = None
+    if max_grad_norm is not None:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), 
+            max_grad_norm
+        ).detach()
+
+    optimizer.step()
+    optimizer.zero_grad()
+    batch_loss = torch.stack(total_loss).sum()
+    batch_token_entropy = entropy_sum / valid_token_count.clamp_min(1)
+
+    return (batch_loss, {
+        "loss": batch_loss, 
+        "gradient_norm": grad_norm, 
+        "token_entropy": batch_token_entropy,
+        "train_rewards": (mean_rewards, mean_formal_rewards)
+    })
+
+
+
+
+
+
