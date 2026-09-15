@@ -238,10 +238,13 @@ def grpo_train_step(
     mean_rewards = rollout_rewards[1]["mean total rewards"]
     mean_formal_rewards = rollout_rewards[1]["mean total format rewards"]
 
-
-    input_ids = tokenizer_response["input_ids"]
-    labels = tokenizer_response["labels"]
-    mask = tokenizer_response["response_mask"]
+    device = next(model.parameters()).device
+    input_ids = tokenizer_response["input_ids"].to(device)
+    labels = tokenizer_response["labels"].to(device)
+    mask = tokenizer_response["response_mask"].to(
+        device=device,
+        dtype=torch.bool,
+    )
 
     # Parameters to return or log
     total_loss = []
@@ -250,10 +253,22 @@ def grpo_train_step(
 
     microbatch_size = len(input_ids) // gradient_accumulation_steps
 
+    group_normalized_rewards = compute_group_normalized_rewards(
+        raw_rewards=raw_rewards, 
+        group_size=group_size, 
+        baseline=baseline, 
+        advantage_eps=advantage_eps, 
+        advantage_normalizer=advantage_normalizer
+    )
+    group_normalized_rewards = group_normalized_rewards[0].to(
+        device=device,
+        dtype=torch.float32,
+    )
+
     for i in range(0, len(input_ids), microbatch_size):
         inputs_microbatch = input_ids[i:i+microbatch_size]
         labels_microbatch = labels[i:i+microbatch_size]
-        rewards_microbatch = raw_rewards[i:i+microbatch_size]
+        rewards_microbatch = group_normalized_rewards[i:i+microbatch_size]
         masks = mask[i:i+microbatch_size]
 
         response_log_probs = get_response_log_probs(
@@ -270,18 +285,8 @@ def grpo_train_step(
         )
         valid_token_count += masks.sum().detach()
 
-
-        group_normalized_rewards = compute_group_normalized_rewards(
-            raw_rewards=rewards_microbatch, 
-            group_size=group_size, 
-            baseline=baseline, 
-            advantage_eps=advantage_eps, 
-            advantage_normalizer=advantage_normalizer
-        )
-        group_normalized_rewards = group_normalized_rewards[0]
-
         policy_gradient_loss = compute_policy_gradient_loss(
-            raw_rewards_or_advantages=group_normalized_rewards, 
+            raw_rewards_or_advantages=rewards_microbatch, 
             policy_log_probs=log_probs, 
             importance_reweighting_method=importance_reweighting_method
         )
@@ -311,9 +316,9 @@ def grpo_train_step(
     batch_token_entropy = entropy_sum / valid_token_count.clamp_min(1)
 
     return (batch_loss, {
-        "loss": batch_loss, 
-        "gradient_norm": grad_norm, 
-        "token_entropy": batch_token_entropy,
+        "loss": batch_loss.item(), 
+        "gradient_norm": grad_norm.item(), 
+        "token_entropy": batch_token_entropy.item(),
         "train_rewards": (mean_rewards, mean_formal_rewards)
     })
 

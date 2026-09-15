@@ -142,7 +142,8 @@ def grpo_traning_process(seed: int):
     policy, tokenizer = get_model_and_tokenizer(
             model_id_or_dir=MODEL_ID, device="cuda:0"
         )
-    server = VLLMServer(model_id=MODEL_ID, gpu=1)
+    device = next(policy.parameters()).device
+    server = VLLMServer(model_id=MODEL_ID, gpu=1, gpu_memory_utilization=0.75)
     optimizer = torch.optim.AdamW(  
         policy.parameters(),
         lr=learning_rate,
@@ -217,8 +218,8 @@ def grpo_traning_process(seed: int):
         log_entry = {
             "seed": seed, 
             "step": step, 
-            "loss": step_result[1]["loss"].item(), 
-            "gradient_norm": step_result[1]["gradient_norm"].item(), 
+            "loss": step_result[1]["loss"], 
+            "gradient_norm": step_result[1]["gradient_norm"], 
             "train_reward_total": step_result[1]["train_rewards"][0], 
             "train_reward_format": step_result[1]["format_rewards"][1], 
             "token_entropy": step_result[1]["token_entropy"]
