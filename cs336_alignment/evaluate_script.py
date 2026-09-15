@@ -43,7 +43,7 @@ three_shot_path = Path.joinpath(current_folder, "prompts/r1_zero_three_shot_gsm8
 zero_path = Path.joinpath(current_folder, "prompts/r1_zero.prompt")
 MODEL_ID = "allenai/OLMo-2-0425-1B"
 prompt_type = "question_only"
-OUTPUT_DIR = current_folder
+OUTPUT_DIR = current_folder / "exp_results" / "eval_sampling_rollouts"
 batch_size = 32
 
 

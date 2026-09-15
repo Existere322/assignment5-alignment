@@ -3,7 +3,7 @@ models/
 
 nav
 tags
-
+cs336_alignment/model_checkpoints/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
