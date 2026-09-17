@@ -27,7 +27,13 @@ n_train_examples = 6400
 n_val_examples = 1024 
 num_rollout_steps = 200 
 each_step_prompts = n_train_examples // num_rollout_steps
-learning_rate = 1e-5 
+LEARNING_RATE_TUNING = {
+    "low": 5e-6, 
+    "default": 1e-5, 
+    "high": 2e-5, 
+}
+exp_name = ["lr_low", "lr_high"]
+learning_rate = LEARNING_RATE_TUNING["high"]
 rollout_batch_size = train_batch_size = 256 
 group_size = 8 
 gradient_accumulation_steps = 64 
@@ -150,7 +156,7 @@ def grpo_traning_process(seed: int):
 
     set_random_seed(seed)
     
-    run_dir = OUTPUT_DIR / f"seed_{seed}"
+    run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[1]}"
     run_dir.mkdir(parents=True, exist_ok=True)
     output_file = open(run_dir / "metrics.jsonl", "w", encoding="utf-8")
     response_file = open(run_dir / "response.jsonl", "w", encoding="utf-8")
@@ -408,23 +414,34 @@ def plot_training_metrics(
 
 
 def main():
-    # SEEDS = [224, 229, 322, 336]
-    SEEDS = [322, 336]
-
+    # SEEDS = [224, 229, 333, 336]
+    SEEDS = [224, 336]
+    TRAINED = False
     all_step_logs = []
 
     for seed in SEEDS:
-        logs = grpo_traning_process(seed)
-        all_step_logs.extend(logs)
+        if not TRAINED:
+            logs = grpo_traning_process(seed)
+            all_step_logs.extend(logs)
 
-        # 释放上一轮训练模型占用的 GPU 0 显存
-        gc.collect()
-        torch.cuda.empty_cache()
+            # 释放上一轮训练模型占用的 GPU 0 显存
+            gc.collect()
+            torch.cuda.empty_cache()
+        else:
+            run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[1]}"
+            with open(run_dir / "metrics.jsonl", "r", encoding="utf-8") as result:
+                for line in result:
+                    if not line.strip():
+                        continue
 
-    # plot_training_metrics(
-    #     all_step_logs=all_step_logs,
-    #     output_dir=OUTPUT_DIR,
-    # )
+                    log_entry = json.loads(line)
+                    log_entry.setdefault("seed", seed)
+                    all_step_logs.append(log_entry)
+
+    plot_training_metrics(
+        all_step_logs=all_step_logs,
+        output_dir=OUTPUT_DIR / f"_{exp_name[1]}",
+    )
 
 
 if __name__ == "__main__": 
