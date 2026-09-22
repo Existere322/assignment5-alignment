@@ -4,7 +4,7 @@ from vllm_utils import VLLMServer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
 from checkpoint import get_model_and_tokenizer
-from drgrpo_grader import r1_zero_reward_fn
+from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from grpo import grpo_train_step
 import random
 import numpy as np
@@ -36,7 +36,7 @@ LEARNING_RATE_TUNING = {
 }
 exp_name = ["lr_low", "lr_high", "default"]
 learning_rate = LEARNING_RATE_TUNING["low"]
-prompt_types = ["question_only", "r1_zero", "r1_three_shot"]
+prompt_types = ["question_only", "r1_three_shot"]
 rollout_batch_size = train_batch_size = 256 
 group_size = 8 
 gradient_accumulation_steps = 64 
@@ -126,7 +126,8 @@ def read_gsm8k_train():
 def evaluate_process(
         seed: int,
         server: VLLMServer,
-        tokenizer
+        tokenizer, 
+        prompt_type
     ):
     eval_sampling_params = {
         "temperature": sampling_temperature, 
@@ -139,7 +140,7 @@ def evaluate_process(
     }
 
     prompts, ground_truths = read_gsm8k_test()
-    formated_prompts = construct_prompt(prompts)
+    formated_prompts = construct_prompt(prompts, prompt_type)
     completions = server.generate_completions(
         prompts=formated_prompts, 
         sampling_params=eval_sampling_params, 
@@ -149,10 +150,16 @@ def evaluate_process(
     grade_results = []
 
     for ground_truth, completion in zip(ground_truths, completions):
-        grade_result = r1_zero_reward_fn(
-            response=completion.text, 
-            ground_truth=ground_truth
-        )
+        if prompt_type != "question_only":
+            grade_result = r1_zero_reward_fn(
+                response=completion.text, 
+                ground_truth=ground_truth
+            )
+        else:
+            grade_result = question_only_reward_fn(
+                response=completion.text, 
+                ground_truth=ground_truth
+            )
 
         grade_results.append(grade_result)
 
@@ -248,13 +255,18 @@ def grpo_traning_process(seed: int, prompt_type: str):
 
         optimizer.zero_grad()
 
+        if prompt_type == "question_only":
+            reward_fn = question_only_reward_fn
+        else:
+            reward_fn = r1_zero_reward_fn
+
         step_result = grpo_train_step(
             model=policy, 
             tokenizer=tokenizer, 
             optimizer=optimizer, 
             gradient_accumulation_steps=gradient_accumulation_steps, 
             max_grad_norm=max_grad_norm, 
-            reward_fn=r1_zero_reward_fn, 
+            reward_fn=reward_fn, 
             repeated_prompts=batch_prompts, 
             rollout_responses=rollout_responses, 
             repeated_ground_truths=batch_ground_truths, 
@@ -279,7 +291,7 @@ def grpo_traning_process(seed: int, prompt_type: str):
         step += 1
 
         if step % 10 == 0:
-            accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer)
+            accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
             policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
             log_entry.update(
                 {
