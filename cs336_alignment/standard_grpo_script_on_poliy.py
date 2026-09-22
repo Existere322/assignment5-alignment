@@ -20,6 +20,8 @@ gsm8k_train = Path.joinpath(root_folder, "data/gsm8k/train.jsonl")
 OUTPUT_DIR = current_folder / "exp_results" / "standard_grpo_on_policy"
 CHECKPOINTS = current_folder / "model_checkpoints"
 zero_path = Path.joinpath(current_folder, "prompts/r1_zero.prompt")
+question_only_path = Path.joinpath(current_folder, "prompts/question_only.prompt")
+three_shot_path = Path.joinpath(current_folder, "prompts/r1_zero_three_shot_gsm8k.prompt")
 
 
 # Hyperparameter initialization
@@ -32,8 +34,9 @@ LEARNING_RATE_TUNING = {
     "default": 1e-5, 
     "high": 2e-5, 
 }
-exp_name = ["lr_low", "lr_high"]
-learning_rate = LEARNING_RATE_TUNING["high"]
+exp_name = ["lr_low", "lr_high", "default"]
+learning_rate = LEARNING_RATE_TUNING["low"]
+prompt_types = ["question_only", "r1_zero", "r1_three_shot"]
 rollout_batch_size = train_batch_size = 256 
 group_size = 8 
 gradient_accumulation_steps = 64 
@@ -74,14 +77,33 @@ def read_gsm8k_test():
     return (questions, answers)
 
 
-def construct_prompt(data):
-    zero_prompt = zero_path.read_text(encoding="utf-8")
-    r1_style_prompts = []
+def construct_prompt(data, prompt_type):
+    if prompt_type == "r1_zero":
+        zero_prompt = zero_path.read_text(encoding="utf-8")
+        r1_style_prompts = []
 
-    for question in data:
-        r1_style_prompts.append(zero_prompt.format(question=question))
+        for question in data:
+            r1_style_prompts.append(zero_prompt.format(question=question))
 
-    return r1_style_prompts
+        return r1_style_prompts
+
+    if prompt_type == "question_only":
+        question_only_prompt = question_only_path.read_text(encoding="utf-8")
+        question_only_prompts = []
+
+        for question in data:
+            question_only_prompts.append(question_only_prompt.format(question=question))
+
+        return question_only_prompts
+
+    if prompt_type == "r1_three_shot":
+        three_shot_prompt = three_shot_path.read_text(encoding="utf-8")
+        three_shot_prompts = []
+
+        for question in data:
+            three_shot_prompts.append(three_shot_prompt.format(question=question))
+
+        return three_shot_prompts
 
 
 def read_gsm8k_train():
@@ -152,11 +174,11 @@ def evaluate_process(
     return accuracy, format_rate, np.mean(response_lengths)
 
 
-def grpo_traning_process(seed: int):
+def grpo_traning_process(seed: int, prompt_type: str):
 
     set_random_seed(seed)
     
-    run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[1]}"
+    run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[2]}_{prompt_type}"
     run_dir.mkdir(parents=True, exist_ok=True)
     output_file = open(run_dir / "metrics.jsonl", "w", encoding="utf-8")
     response_file = open(run_dir / "response.jsonl", "w", encoding="utf-8")
@@ -181,7 +203,7 @@ def grpo_traning_process(seed: int):
     server.init_weight_sync(policy_device="cuda:0")
     server.sync_policy_weights(policy=policy)
     prompts, answers = read_gsm8k_train()
-    formated_prompts = construct_prompt(prompts)
+    formated_prompts = construct_prompt(prompts, prompt_type)
 
     step_logs = []
 
@@ -415,33 +437,34 @@ def plot_training_metrics(
 
 def main():
     # SEEDS = [224, 229, 333, 336]
-    SEEDS = [224, 336]
+    SEEDS = [224, 229, 336]
     TRAINED = False
     all_step_logs = []
 
-    for seed in SEEDS:
-        if not TRAINED:
-            logs = grpo_traning_process(seed)
-            all_step_logs.extend(logs)
+    for prompt_type in prompt_types:
+        for seed in SEEDS:
+            if not TRAINED:
+                logs = grpo_traning_process(seed, prompt_type)
+                all_step_logs.extend(logs)
 
-            # 释放上一轮训练模型占用的 GPU 0 显存
-            gc.collect()
-            torch.cuda.empty_cache()
-        else:
-            run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[1]}"
-            with open(run_dir / "metrics.jsonl", "r", encoding="utf-8") as result:
-                for line in result:
-                    if not line.strip():
-                        continue
+                # 释放上一轮训练模型占用的 GPU 0 显存
+                gc.collect()
+                torch.cuda.empty_cache()
+            else:
+                run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[2]}_{prompt_type}"
+                with open(run_dir / "metrics.jsonl", "r", encoding="utf-8") as result:
+                    for line in result:
+                        if not line.strip():
+                            continue
 
-                    log_entry = json.loads(line)
-                    log_entry.setdefault("seed", seed)
-                    all_step_logs.append(log_entry)
+                        log_entry = json.loads(line)
+                        log_entry.setdefault("seed", seed)
+                        all_step_logs.append(log_entry)
 
-    plot_training_metrics(
-        all_step_logs=all_step_logs,
-        output_dir=OUTPUT_DIR / f"_{exp_name[1]}",
-    )
+        plot_training_metrics(
+            all_step_logs=all_step_logs,
+            output_dir=OUTPUT_DIR / f"_{exp_name[2]}_{prompt_type}",
+        )
 
 
 if __name__ == "__main__": 
