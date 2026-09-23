@@ -478,6 +478,8 @@ def main():
             output_dir=OUTPUT_DIR / f"_{exp_name[2]}_{prompt_type}",
         )
 
+        all_step_logs = []
+
 
 if __name__ == "__main__": 
     main()
