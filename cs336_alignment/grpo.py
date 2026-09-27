@@ -142,10 +142,6 @@ def compute_group_normalized_rewards(
     advantage_normalizer: Literal["std", "none", "mean"] = "std", 
 ):
     # rollout_batch_size = n_prompts_per_rollout_batch * group_size
-    if baseline != "mean":
-        raise NotImplementedError
-    if advantage_normalizer != "std":
-        raise NotImplementedError
 
     grouped_rewards = rearrange(
         raw_rewards,
@@ -158,9 +154,23 @@ def compute_group_normalized_rewards(
     max_rewards = torch.max(raw_rewards, dim=-1)
     min_rewards = torch.min(raw_rewards, dim=-1)
 
-    normalized_rewards = (grouped_rewards - group_mean) / (group_std + advantage_eps)
+    if baseline == "none":
+        group_mean = torch.zeros_like(group_mean)
 
-    result = rearrange(normalized_rewards, "n g -> (n g)")
+    if advantage_normalizer == "std":
+        normalized_rewards = (grouped_rewards - group_mean) / (group_std + advantage_eps)
+        result = rearrange(normalized_rewards, "n g -> (n g)")
+
+    elif advantage_normalizer == "none":
+        rewards = grouped_rewards - group_mean
+        result = rearrange(rewards, "n g -> (n g)")
+
+    elif advantage_normalizer == "mean":
+        rewards = (grouped_rewards - group_mean) / (group_mean + advantage_eps)
+        result = rearrange(rewards, "n g -> (n g)")
+
+    else:
+        raise ValueError
 
     return (result, {"metadata":{"group_mean": group_mean, "group_std": group_std, "group_max": max_rewards, "group_min": min_rewards}})
 
@@ -192,12 +202,13 @@ def aggregate_loss_across_microbatch(
 ) -> torch.Tensor:
     # per_token_policy_gradient_loss: batch_size, sequence_length
     # mask: batch_size, sequence_length
+    # this function is computing sequence normalization
     sequence_lengths = mask.sum(dim=-1)
     masked_per_token_loss = per_token_policy_gradient_loss.masked_fill(~mask, 0)
     if loss_normalization == "sequence":
         total_loss = torch.mean(torch.sum(masked_per_token_loss, dim=-1) / sequence_lengths, dim=-1)
     if loss_normalization == "constant":
-        total_loss = torch.sum(torch.sum(per_token_policy_gradient_loss, dim=-1), dim=-1)
+        total_loss = torch.sum(torch.sum(masked_per_token_loss, dim=-1), dim=-1)
         total_loss = total_loss / normalization_constant
 
     return total_loss
@@ -226,12 +237,6 @@ def grpo_train_step(
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
 )-> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
-
-    if importance_reweighting_method != "none":
-        raise NotImplementedError
-
-    if loss_normalization != "sequence":
-        raise NotImplementedError
 
     tokenizer_response = tokenize_prompt_and_output(
         prompt_strs=repeated_prompts, 
@@ -275,11 +280,73 @@ def grpo_train_step(
         dtype=torch.float32,
     )
 
-    for i in range(0, len(input_ids), microbatch_size):
-        inputs_microbatch = input_ids[i:i+microbatch_size]
-        labels_microbatch = labels[i:i+microbatch_size]
-        rewards_microbatch = group_normalized_rewards[i:i+microbatch_size]
-        masks = mask[i:i+microbatch_size]
+    # clipping the zero advantage groups
+    if baseline == "mean":
+        num_sequences = group_normalized_rewards.shape[0]
+        num_groups = num_sequences // group_size
+        # [num_groups * group_size]
+        zero_sequence_mask = torch.isclose(
+            group_normalized_rewards,
+            torch.zeros_like(group_normalized_rewards),
+            atol=1e-8,
+            rtol=0.0,
+        )
+        # [num_groups, group_size]
+        zero_sequence_mask_by_group = zero_sequence_mask.reshape(
+            num_groups,
+            group_size,
+        )
+
+        # 只有当一个组中的所有 normalized advantages 都为 0 时，
+        # 才认为整个组可以删除
+        zero_group_mask = zero_sequence_mask_by_group.all(dim=1)
+
+        # 保留并非全零的组
+        keep_group_mask = ~zero_group_mask
+        # 将 group-level mask 展开成 sequence-level mask
+        keep_sequence_mask = keep_group_mask.repeat_interleave(group_size)
+
+        # 裁剪输入
+        clipped_input_ids = input_ids[keep_sequence_mask]
+        clipped_labels = labels[keep_sequence_mask]
+        clipped_group_normalized_rewards = group_normalized_rewards[keep_sequence_mask]
+        clipped_mask = mask[keep_sequence_mask]
+
+    elif baseline == "none":
+        zero_mask = torch.isclose(
+            group_normalized_rewards,
+            torch.zeros_like(group_normalized_rewards),
+            atol=1e-8,
+            rtol=0.0,
+        )
+
+        keep_mask = ~zero_mask
+
+        clipped_input_ids = input_ids[keep_mask]
+        clipped_labels = labels[keep_mask]
+        clipped_group_normalized_rewards = group_normalized_rewards[keep_mask]
+        clipped_mask = mask[keep_mask]
+
+    num_kept_sequences = clipped_input_ids.shape[0]
+
+    if num_kept_sequences == 0:
+        zero = torch.zeros((), device=device)
+
+        return zero, {
+            "loss": 0.0,
+            "gradient_norm": 0.0,
+            "token_entropy": 0.0,
+            "train_rewards": (
+                mean_rewards,
+                mean_formal_rewards,
+            ),
+        }
+
+    for i in range(0, len(clipped_input_ids), microbatch_size):
+        inputs_microbatch = clipped_input_ids[i:i+microbatch_size]
+        labels_microbatch = clipped_labels[i:i+microbatch_size]
+        rewards_microbatch = clipped_group_normalized_rewards[i:i+microbatch_size]
+        masks = clipped_mask[i:i+microbatch_size]
 
         response_log_probs = get_response_log_probs(
             model=model, 
@@ -307,7 +374,11 @@ def grpo_train_step(
             mask=masks, 
             loss_normalization=loss_normalization, 
             normalization_constant=normalization_constant
-        ) * (len(inputs_microbatch) / len(input_ids))
+        )
+
+        if loss_normalization == "sequence":
+            aggregated_loss = aggregated_loss * (len(inputs_microbatch) / len(input_ids))
+
         aggregated_loss.backward()
         total_loss.append(aggregated_loss.detach())
         # detach 创建一个与原 Tensor 共享数值、但脱离 autograd 计算图的 Tensor
