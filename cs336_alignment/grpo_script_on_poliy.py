@@ -34,9 +34,9 @@ LEARNING_RATE_TUNING = {
     "default": 1e-5, 
     "high": 2e-5, 
 }
-exp_name = ["lr_low", "lr_high", "default"]
-learning_rate = LEARNING_RATE_TUNING["low"]
-prompt_types = ["question_only", "r1_three_shot"]
+exp_name = ["lr_low", "lr_high", "default", ]
+learning_rate = LEARNING_RATE_TUNING["default"]
+prompt_types = ["r1_zero"]
 rollout_batch_size = train_batch_size = 256 
 group_size = 8 
 gradient_accumulation_steps = 64 
@@ -47,6 +47,7 @@ baseline = "mean"
 advantage_eps = 1e-6
 importance_reweighting_method = "none"
 loss_normalization = "sequence"
+normalization_constant = sampling_max_tokens * train_batch_size
 
 # Model and tokenizer settings
 MODEL_ID = "allenai/OLMo-2-0425-1B"
@@ -181,11 +182,11 @@ def evaluate_process(
     return accuracy, format_rate, np.mean(response_lengths)
 
 
-def grpo_traning_process(seed: int, prompt_type: str):
+def grpo_traning_process(seed: int, prompt_type: str, variant: str):
 
     set_random_seed(seed)
     
-    run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[2]}_{prompt_type}"
+    run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{prompt_type}_{exp_name[2]}"
     run_dir.mkdir(parents=True, exist_ok=True)
     output_file = open(run_dir / "metrics.jsonl", "w", encoding="utf-8")
     response_file = open(run_dir / "response.jsonl", "w", encoding="utf-8")
@@ -205,6 +206,22 @@ def grpo_traning_process(seed: int, prompt_type: str):
         betas=(0.9, 0.95), 
         weight_decay=0.0 
     )
+
+    # GRPO variants:
+    baseline = "mean"
+    if variant == "GRPO_constant":
+        advantage_normalizer = "std"
+        loss_normalization = "constant"
+    if variant == "Dr_GRPO":
+        advantage_normalizer = "none"
+        loss_normalization = "constant"
+    if variant == "RFT":
+        baseline = "none"
+        advantage_normalizer = "none"
+        loss_normalization = "constant"
+    if variant == "MaxRL":
+        advantage_normalizer = "mean"
+        loss_normalization = "constant"
 
     server.start()
     server.init_weight_sync(policy_device="cuda:0")
@@ -273,8 +290,10 @@ def grpo_traning_process(seed: int, prompt_type: str):
             group_size=group_size, 
             baseline=baseline, 
             advantage_eps=advantage_eps, 
+            advantage_normalizer = advantage_normalizer, 
             importance_reweighting_method=importance_reweighting_method, 
             loss_normalization=loss_normalization, 
+            normalization_constant = normalization_constant
         )
 
         log_entry = {
@@ -284,7 +303,8 @@ def grpo_traning_process(seed: int, prompt_type: str):
             "gradient_norm": step_result[1]["gradient_norm"], 
             "train_reward_total": step_result[1]["train_rewards"][0], 
             "train_reward_format": step_result[1]["train_rewards"][1], 
-            "token_entropy": step_result[1]["token_entropy"]
+            "token_entropy": step_result[1]["token_entropy"], 
+            "valid_seq_num": step_result[1]["num_valid"]
         }
 
         server.sync_policy_weights(policy=policy)
@@ -448,22 +468,23 @@ def plot_training_metrics(
 
 
 def main():
-    # SEEDS = [224, 229, 333, 336]
-    SEEDS = [224, 229, 336]
+    SEEDS = [224, 229, 333, 336]
     TRAINED = False
     all_step_logs = []
+    variant_types = ["GRPO_constant", "Dr_GRPO", "RFT", "MaxRL"]
 
-    for prompt_type in prompt_types:
+    for variant in variant_types:
+        prompt_type = "r1_zero"
         for seed in SEEDS:
             if not TRAINED:
-                logs = grpo_traning_process(seed, prompt_type)
+                logs = grpo_traning_process(seed, prompt_type, variant)
                 all_step_logs.extend(logs)
 
                 # 释放上一轮训练模型占用的 GPU 0 显存
                 gc.collect()
                 torch.cuda.empty_cache()
             else:
-                run_dir = OUTPUT_DIR / f"seed_{seed}_{exp_name[2]}_{prompt_type}"
+                run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{exp_name[2]}"
                 with open(run_dir / "metrics.jsonl", "r", encoding="utf-8") as result:
                     for line in result:
                         if not line.strip():
@@ -475,7 +496,7 @@ def main():
 
         plot_training_metrics(
             all_step_logs=all_step_logs,
-            output_dir=OUTPUT_DIR / f"_{exp_name[2]}_{prompt_type}",
+            output_dir=OUTPUT_DIR / f"_{variant}_{exp_name[2]}",
         )
 
         all_step_logs = []

@@ -340,6 +340,7 @@ def grpo_train_step(
                 mean_rewards,
                 mean_formal_rewards,
             ),
+            "num_valid": 0, 
         }
 
     for i in range(0, len(clipped_input_ids), microbatch_size):
@@ -400,7 +401,8 @@ def grpo_train_step(
         "loss": batch_loss.item(), 
         "gradient_norm": grad_norm.item(), 
         "token_entropy": batch_token_entropy.item(),
-        "train_rewards": (mean_rewards, mean_formal_rewards)
+        "train_rewards": (mean_rewards, mean_formal_rewards),
+        "num_valid": num_kept_sequences, 
     })
 
 
