@@ -185,11 +185,35 @@ def compute_policy_gradient_loss(
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     # raw_rewards_or_advantages: Shape (batch_size,) or (batch_size, 1)
     # policy_log_probs: (batch_size, sequence_length)
-    if importance_reweighting_method != "none":
-        raise NotImplementedError
 
     advantages = raw_rewards_or_advantages.unsqueeze(-1) if raw_rewards_or_advantages.ndim == 1 else raw_rewards_or_advantages
-    per_token_policy_loss = -(advantages * policy_log_probs)
+
+    if importance_reweighting_method == "none":
+        per_token_policy_loss = -(advantages * policy_log_probs)
+
+    if importance_reweighting_method == "noclip":
+        reweighting_param = torch.exp(policy_log_probs - old_log_probs.detach())
+        per_token_policy_loss = -(advantages * reweighting_param)
+        # reweighting param dimension: (batch_size, 1)
+    if importance_reweighting_method == "grpo":
+        importance_ratio = torch.exp(policy_log_probs - old_log_probs.detach())
+        clipped_ratio = torch.clamp(
+            importance_ratio,
+            min=1.0 - cliprange,
+            max=1.0 + cliprange,
+        )
+
+        unclipped_objective = advantages * importance_ratio
+        clipped_objective = advantages * clipped_ratio
+
+        per_token_objective = torch.minimum(
+            unclipped_objective,
+            clipped_objective,
+        )
+        per_token_policy_loss = -per_token_objective
+
+    if importance_reweighting_method == "gspo":
+        raise NotImplementedError
 
     return (per_token_policy_loss, {})
 
@@ -207,6 +231,7 @@ def aggregate_loss_across_microbatch(
     masked_per_token_loss = per_token_policy_gradient_loss.masked_fill(~mask, 0)
     if loss_normalization == "sequence":
         total_loss = torch.mean(torch.sum(masked_per_token_loss, dim=-1) / sequence_lengths, dim=-1)
+        # 其中 mean 在 B G 两个维度进行了求平均，相当于所有项目加起来，然后求平均
     if loss_normalization == "constant":
         total_loss = torch.sum(torch.sum(masked_per_token_loss, dim=-1), dim=-1)
         total_loss = total_loss / normalization_constant

@@ -31,11 +31,12 @@ num_rollout_steps = 200
 each_step_prompts = n_train_examples // num_rollout_steps
 LEARNING_RATE_TUNING = {
     "low": 5e-6, 
+    "medium": 7e-6, 
     "default": 1e-5, 
     "high": 2e-5, 
 }
-exp_name = ["lr_low", "lr_high", "default", ]
-learning_rate = LEARNING_RATE_TUNING["default"]
+exp_name = ["lr_low", "lr_high", "medium", "default"]
+learning_rate = LEARNING_RATE_TUNING["medium"]
 prompt_types = ["r1_zero"]
 rollout_batch_size = train_batch_size = 256 
 group_size = 8 
