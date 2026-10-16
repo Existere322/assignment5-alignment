@@ -213,7 +213,37 @@ def compute_policy_gradient_loss(
         per_token_policy_loss = -per_token_objective
 
     if importance_reweighting_method == "gspo":
-        raise NotImplementedError
+        log_ratio = policy_log_probs - old_log_probs
+        mask = response_mask.to(log_ratio.dtype)
+        seq_len = mask.sum(dim=-1, keepdim=True)
+        valid_sequence = seq_len > 0
+
+        mean_log_ratio = (
+            (log_ratio * mask).sum(dim=-1, keepdim=True)
+            / seq_len.clamp_min(1)
+        )
+        importance_ratio = torch.exp(mean_log_ratio)
+        # For numerical stability, perform the reduction in log space
+
+        clipped_ratio = torch.clamp(
+            importance_ratio,
+            min=1.0 - cliprange,
+            max=1.0 + cliprange,
+        )
+
+        advantages = advantages.detach()
+
+        unclipped_objective = advantages * importance_ratio
+        clipped_objective = advantages * clipped_ratio
+
+        sequence_objective = torch.minimum(
+            unclipped_objective,
+            clipped_objective,
+        )
+
+        per_token_policy_loss = (
+            -sequence_objective.expand_as(policy_log_probs)
+        )  # [b, s]
 
     return (per_token_policy_loss, {})
 
@@ -266,7 +296,7 @@ def grpo_train_step(
     tokenizer_response = tokenize_prompt_and_output(
         prompt_strs=repeated_prompts, 
         output_strs=rollout_responses, 
-        tokenizer=tokenizer
+        tokenizer=tokenizer, 
     )
 
     rollout_rewards = compute_rollout_rewards(
@@ -285,6 +315,11 @@ def grpo_train_step(
         device=device,
         dtype=torch.bool,
     )
+
+    if importance_reweighting_method != "none":
+        old_log_probs = old_log_probs.to(device)
+    else:
+        old_log_probs = None
 
     # Parameters to return or log
     total_loss = []
@@ -336,6 +371,7 @@ def grpo_train_step(
         clipped_labels = labels[keep_sequence_mask]
         clipped_group_normalized_rewards = group_normalized_rewards[keep_sequence_mask]
         clipped_mask = mask[keep_sequence_mask]
+        clipped_old_log_probs = old_log_probs[keep_sequence_mask] if old_log_probs is not None else None
 
     elif baseline == "none":
         zero_mask = torch.isclose(
@@ -351,6 +387,7 @@ def grpo_train_step(
         clipped_labels = labels[keep_mask]
         clipped_group_normalized_rewards = group_normalized_rewards[keep_mask]
         clipped_mask = mask[keep_mask]
+        clipped_old_log_probs = old_log_probs[keep_mask] if old_log_probs is not None else None
 
     num_kept_sequences = clipped_input_ids.shape[0]
 
@@ -368,11 +405,15 @@ def grpo_train_step(
             "num_valid": 0, 
         }
 
+    if importance_reweighting_method == "none":
+        clipped_old_log_probs = None
+
     for i in range(0, len(clipped_input_ids), microbatch_size):
         inputs_microbatch = clipped_input_ids[i:i+microbatch_size]
         labels_microbatch = clipped_labels[i:i+microbatch_size]
         rewards_microbatch = clipped_group_normalized_rewards[i:i+microbatch_size]
         masks = clipped_mask[i:i+microbatch_size]
+        minibatch_old_log_probs = clipped_old_log_probs[i:i+microbatch_size] if clipped_old_log_probs is not None else None
 
         response_log_probs = get_response_log_probs(
             model=model, 
@@ -381,6 +422,11 @@ def grpo_train_step(
             return_token_entropy=True
         )
         log_probs = response_log_probs["log_probs"]
+
+        assert log_probs.shape == masks.shape
+
+        # if minibatch_old_log_probs is not None:
+        #     assert log_probs.shape == minibatch_old_log_probs.shape
 
         per_token_entropy = response_log_probs["token_entropy"]
         entropy_sum += (
@@ -391,7 +437,10 @@ def grpo_train_step(
         policy_gradient_loss = compute_policy_gradient_loss(
             raw_rewards_or_advantages=rewards_microbatch, 
             policy_log_probs=log_probs, 
-            importance_reweighting_method=importance_reweighting_method
+            importance_reweighting_method=importance_reweighting_method, 
+            old_log_probs=minibatch_old_log_probs, 
+            cliprange=cliprange, 
+            response_mask=masks
         )
         per_token_policy_loss = policy_gradient_loss[0]
 

@@ -23,6 +23,7 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    old_log_probs: list[float]
 
 
 @dataclass
@@ -201,6 +202,7 @@ def generate_completions(
             "n": sampling_params["n"],
             "seed": sampling_params["seed"],
             "return_token_ids": True,
+            "logprobs": 1,
         }
         if sampling_params.get("stop") is not None:
             payload["stop"] = sampling_params["stop"]
@@ -212,6 +214,9 @@ def generate_completions(
             VLLMCompletion(
                 text=choice["text"],
                 token_ids=choice.get("token_ids") or [],
+                old_log_probs=[
+                    float(value) for value in choice.get("logprobs").get("token_logprobs")
+                ],
                 finish_reason=choice.get("finish_reason"),
             )
             for choice in choices

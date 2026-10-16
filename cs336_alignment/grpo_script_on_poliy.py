@@ -1,7 +1,8 @@
 import torch
 import json
-from vllm_utils import VLLMServer
+from vllm_utils import VLLMServer, VLLMCompletion
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from grpo import tokenize_prompt_and_output
 from pathlib import Path
 from checkpoint import get_model_and_tokenizer
 from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
@@ -35,12 +36,23 @@ LEARNING_RATE_TUNING = {
     "default": 1e-5, 
     "high": 2e-5, 
 }
-exp_name = ["lr_low", "lr_high", "medium", "default"]
-learning_rate = LEARNING_RATE_TUNING["medium"]
+exp_name = ["lr_low", "lr_high", "default", "medium"]
+variants = ["noclip", "grpo", "gspo"]
+learning_rate = LEARNING_RATE_TUNING["default"]
 prompt_types = ["r1_zero"]
-rollout_batch_size = train_batch_size = 256 
+
+# on policy params
+# gradient_accumulation_steps = 64 
+# rollout_batch_size = train_batch_size = 256 
+
+# off policy params
+Off_policy = True
+gradient_accumulation_steps = 1
+rollout_batch_size = 256  # 一次推理生成的结果数量
+train_batch_size = 8  # 训练一个 batch 使用的样例数量
+standard_cliprange = 0.2
+gspo_cliprange = 3e-4
 group_size = 8 
-gradient_accumulation_steps = 64 
 sampling_temperature = 1.0 
 sampling_max_tokens = 512 
 max_grad_norm = 1.0 
@@ -183,7 +195,64 @@ def evaluate_process(
     return accuracy, format_rate, np.mean(response_lengths)
 
 
-def grpo_traning_process(seed: int, prompt_type: str, variant: str):
+def completions_to_old_log_probs(
+    completions: list[VLLMCompletion],
+    response_mask: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    completions[i].old_log_probs:
+        第 i 个 response 的紧凑 log-probs，长度为 response token 数。
+
+    response_mask:
+        完整 shifted sequence mask，形状 [B, S]。
+
+    Returns:
+        full-aligned old_log_probs，形状 [B, S]。
+    """
+    response_mask = response_mask.to(
+        device=device,
+        dtype=torch.bool,
+    )
+
+    batch_size, _ = response_mask.shape
+
+    if len(completions) != batch_size:
+        raise ValueError(
+            f"Number of completions ({len(completions)}) "
+            f"does not match batch size ({batch_size})."
+        )
+
+    old_log_probs = torch.zeros(
+        response_mask.shape,
+        dtype=torch.float32,
+        device=device,
+    )
+
+    for i, completion in enumerate(completions):
+        sequence_log_probs = torch.as_tensor(
+            completion.old_log_probs,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        expected_length = int(response_mask[i].sum().item())
+        actual_length = sequence_log_probs.numel()
+
+        if actual_length != expected_length:
+            raise ValueError(
+                f"Completion {i} token/log-prob length mismatch: "
+                f"vLLM returned {actual_length}, "
+                f"but response_mask contains {expected_length} "
+                "valid response positions."
+            )
+
+        old_log_probs[i, response_mask[i]] = sequence_log_probs
+
+    return old_log_probs
+
+
+def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_variant: str):
 
     set_random_seed(seed)
     
@@ -271,69 +340,120 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str):
             for completion in vllm_completion
         ]
 
-        optimizer.zero_grad()
+        num_rollout_responses = len(vllm_completion)
 
-        if prompt_type == "question_only":
-            reward_fn = question_only_reward_fn
-        else:
-            reward_fn = r1_zero_reward_fn
+        for train_start in range(
+            0,
+            num_rollout_responses,
+            train_batch_size,
+        ):
+            train_end = train_start + train_batch_size
 
-        step_result = grpo_train_step(
-            model=policy, 
-            tokenizer=tokenizer, 
-            optimizer=optimizer, 
-            gradient_accumulation_steps=gradient_accumulation_steps, 
-            max_grad_norm=max_grad_norm, 
-            reward_fn=reward_fn, 
-            repeated_prompts=batch_prompts, 
-            rollout_responses=rollout_responses, 
-            repeated_ground_truths=batch_ground_truths, 
-            group_size=group_size, 
-            baseline=baseline, 
-            advantage_eps=advantage_eps, 
-            advantage_normalizer = advantage_normalizer, 
-            importance_reweighting_method=importance_reweighting_method, 
-            loss_normalization=loss_normalization, 
-            normalization_constant = normalization_constant
-        )
+            train_completions = vllm_completion[
+                train_start:train_end
+            ]
 
-        log_entry = {
-            "seed": seed, 
-            "step": step, 
-            "loss": step_result[1]["loss"], 
-            "gradient_norm": step_result[1]["gradient_norm"], 
-            "train_reward_total": step_result[1]["train_rewards"][0], 
-            "train_reward_format": step_result[1]["train_rewards"][1], 
-            "token_entropy": step_result[1]["token_entropy"], 
-            "valid_seq_num": step_result[1]["num_valid"]
-        }
+            train_prompts = batch_prompts[
+                train_start:train_end
+            ]
+
+            train_responses = rollout_responses[
+                train_start:train_end
+            ]
+
+            train_ground_truths = batch_ground_truths[
+                train_start:train_end
+            ]
+
+            # 先用与 grpo_train_step 相同的函数得到 response mask。
+            train_tokenized = tokenize_prompt_and_output(
+                prompt_strs=train_prompts,
+                output_strs=train_responses,
+                tokenizer=tokenizer,
+            )
+
+            train_response_mask = train_tokenized[
+                "response_mask"
+            ]
+
+            # 将 list[list[float]] 转换成 full-aligned tensor [8, S]。
+            train_old_log_probs = completions_to_old_log_probs(
+                completions=train_completions,
+                response_mask=train_response_mask,
+                device=TRAIN_DEVICE,
+            )
+
+            optimizer.zero_grad()
+
+            if prompt_type == "question_only":
+                reward_fn = question_only_reward_fn
+            else:
+                reward_fn = r1_zero_reward_fn
+
+            if offpolicy_variant == "gspo":
+                clip_range = gspo_cliprange
+            else:
+                clip_range = standard_cliprange
+
+            step_result = grpo_train_step(
+                model=policy, 
+                tokenizer=tokenizer, 
+                optimizer=optimizer, 
+                gradient_accumulation_steps=gradient_accumulation_steps, 
+                max_grad_norm=max_grad_norm, 
+                reward_fn=reward_fn, 
+                repeated_prompts=train_prompts, 
+                rollout_responses=train_responses, 
+                repeated_ground_truths=train_ground_truths, 
+                group_size=group_size, 
+                baseline=baseline, 
+                advantage_eps=advantage_eps, 
+                advantage_normalizer = advantage_normalizer, 
+                importance_reweighting_method=offpolicy_variant, 
+                old_log_probs=train_old_log_probs, 
+                clip_range = clip_range, 
+                loss_normalization=loss_normalization, 
+                normalization_constant = normalization_constant
+            )
+
+            log_entry = {
+                "seed": seed, 
+                "step": step, 
+                "loss": step_result[1]["loss"], 
+                "gradient_norm": step_result[1]["gradient_norm"], 
+                "train_reward_total": step_result[1]["train_rewards"][0], 
+                "train_reward_format": step_result[1]["train_rewards"][1], 
+                "token_entropy": step_result[1]["token_entropy"], 
+                "valid_seq_num": step_result[1]["num_valid"]
+            }
+
+            step += 1
+
+            if step % 10 == 0:
+                accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
+                policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
+                log_entry.update(
+                    {
+                        "val_reward_total": accuracy, 
+                        "val_reward_format": format_rate, 
+                        "val_response_length": mean_response_length
+                    }
+                )
+
+            output_file.write(
+                json.dumps(log_entry, ensure_ascii=False) + "\n"
+            )
+            output_file.flush()
+            step_logs.append(log_entry)
+
+            if step % 40 == 0:
+                response_file.writelines(
+                    json.dumps(response, ensure_ascii=False) + "\n"
+                    for response in rollout_responses
+                )
+                response_file.flush()
 
         server.sync_policy_weights(policy=policy)
-        step += 1
-
-        if step % 10 == 0:
-            accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
-            policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
-            log_entry.update(
-                {
-                    "val_reward_total": accuracy, 
-                    "val_reward_format": format_rate, 
-                    "val_response_length": mean_response_length
-                }
-            )
-
-        output_file.write(
-            json.dumps(log_entry, ensure_ascii=False) + "\n"
-        )
-        output_file.flush()
-        step_logs.append(log_entry)
-
-        if step % 40 == 0:
-            response_file.writelines(
-                json.dumps(response, ensure_ascii=False) + "\n"
-                for response in rollout_responses
-            )
-            response_file.flush()
                 
 
     server.stop()
@@ -472,20 +592,22 @@ def main():
     SEEDS = [224, 229, 333, 336]
     TRAINED = False
     all_step_logs = []
-    variant_types = ["GRPO_constant", "Dr_GRPO", "RFT", "MaxRL"]
+    variant_types = ["GRPO_constant", "Dr_GRPO", "RFT", "MaxRL"]  # on policy variants
+    off_policy_variants = ["noclip", "grpo", "gspo"]
 
-    for variant in variant_types:
+    variant = variant_types[1]
+    for offpolicy_variant in off_policy_variants:
         prompt_type = "r1_zero"
         for seed in SEEDS:
             if not TRAINED:
-                logs = grpo_traning_process(seed, prompt_type, variant)
+                logs = grpo_traning_process(seed, prompt_type, variant, offpolicy_variant)
                 all_step_logs.extend(logs)
 
                 # 释放上一轮训练模型占用的 GPU 0 显存
                 gc.collect()
                 torch.cuda.empty_cache()
             else:
-                run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{exp_name[2]}"
+                run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{exp_name[2]}_{offpolicy_variant}"
                 with open(run_dir / "metrics.jsonl", "r", encoding="utf-8") as result:
                     for line in result:
                         if not line.strip():
@@ -497,7 +619,7 @@ def main():
 
         plot_training_metrics(
             all_step_logs=all_step_logs,
-            output_dir=OUTPUT_DIR / f"_{variant}_{exp_name[2]}",
+            output_dir=OUTPUT_DIR / f"_{variant}_{exp_name[2]}_{offpolicy_variant}",
         )
 
         all_step_logs = []
