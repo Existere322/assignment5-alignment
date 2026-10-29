@@ -71,7 +71,7 @@ def get_response_log_probs(
 ) -> dict[str, torch.Tensor]:
     # return_token_entropy 为 True 的位置显示 token 的概率
     logits = model(input_ids).logits  # (batch_size, sequence_length, vocabulary_size)
-    all_log_probs = F.log_softmax(logits, dim=-1)
+    all_log_probs = F.log_softmax(logits, dim=-1, dtype=torch.float32)
 
     # log_probability means log P(y_t | x, y<t) 
     # 其中 P() = e^t/sum_k (e^k) 也就是 softmax 结果，因此可以用 log_softmax 求取
@@ -84,10 +84,12 @@ def get_response_log_probs(
         logits,
         dim=-1,
         index=labels.unsqueeze(-1),
-    ).squeeze(-1)
+    ).squeeze(-1).float()
 
-    log_normalizer = torch.logsumexp(logits, dim=-1)
+    log_normalizer = torch.logsumexp(logits.float(), dim=-1)
     token_log_probs = selected_logits - log_normalizer
+    # the output of vllm log_probs is fp32, to keep the same dtype, we should make 
+    # sure our token_log_probs are same with it.
     # 与 crsoss entropy 的区别就是这个得到的是 log p(label) 而前者得到的是 -log p(label)
 
     result = {
@@ -257,7 +259,7 @@ def aggregate_loss_across_microbatch(
     # per_token_policy_gradient_loss: batch_size, sequence_length
     # mask: batch_size, sequence_length
     # this function is computing sequence normalization
-    sequence_lengths = mask.sum(dim=-1)
+    sequence_lengths = mask.sum(dim=-1).clamp_min(1)
     masked_per_token_loss = per_token_policy_gradient_loss.masked_fill(~mask, 0)
     if loss_normalization == "sequence":
         total_loss = torch.mean(torch.sum(masked_per_token_loss, dim=-1) / sequence_lengths, dim=-1)

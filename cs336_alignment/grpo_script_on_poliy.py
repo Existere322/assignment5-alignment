@@ -2,7 +2,6 @@ import torch
 import json
 from vllm_utils import VLLMServer, VLLMCompletion
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from grpo import tokenize_prompt_and_output
 from pathlib import Path
 from checkpoint import get_model_and_tokenizer
 from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
@@ -195,6 +194,43 @@ def evaluate_process(
     return accuracy, format_rate, np.mean(response_lengths)
 
 
+def padding_mask_matrix(
+    completions: list[VLLMCompletion]
+) -> torch.Tensor:
+    sequence_tokens = []
+    sequence_masks = []
+    for completion in completions:
+        # encode 反回的是一维列表，因此要先转换为 tensor
+        prompt_ids = completion.prompt_ids
+        output_ids = completion.token_ids
+        tokens = torch.tensor(
+            prompt_ids + output_ids, 
+            dtype=torch.long
+        )
+        combined_mask = torch.tensor(
+            [False] * len(prompt_ids) + [True] * len(output_ids)
+        )
+
+        sequence_tokens.append(tokens)
+        sequence_masks.append(combined_mask)
+
+    max_length = max(sequence.numel() for sequence in sequence_tokens)
+    batch_size = len(sequence_tokens)
+
+    padded_response_mask = torch.zeros(
+        (batch_size, max_length),
+        dtype=torch.bool,
+    )
+
+    for index, (tokens, mask) in enumerate(
+        zip(sequence_tokens, sequence_masks)
+    ):
+        sequence_length = tokens.numel()
+        padded_response_mask[index, :sequence_length] = mask
+
+    return padded_response_mask[:, 1:]
+
+
 def completions_to_old_log_probs(
     completions: list[VLLMCompletion],
     response_mask: torch.Tensor,
@@ -304,9 +340,12 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
     step = 0
 
     for i in range(0, n_train_examples, each_step_prompts):
+        # 每个 step 32 个样例，每个采样 8 个结果，因此一个 batch 256 条数据
+        # 先取出不重复的 32 个样例
         batch_single_prompts = formated_prompts[i:i+each_step_prompts]
         batch_single_answers = answers[i:i+each_step_prompts]
 
+        # group size 为 8 重复 8 次，然后得到 256 条结果
         batch_prompts = [
             prompt
             for prompt in batch_single_prompts
@@ -365,16 +404,20 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 train_start:train_end
             ]
 
-            # 先用与 grpo_train_step 相同的函数得到 response mask。
-            train_tokenized = tokenize_prompt_and_output(
-                prompt_strs=train_prompts,
-                output_strs=train_responses,
-                tokenizer=tokenizer,
-            )
+            # asserting if the tokenizer generate the right result
+            for prompt, completion in zip(train_prompts, train_completions):
+                encoded_prompt = tokenizer.encode(
+                    prompt, add_special_tokens=False
+                )
+                encoded_response = tokenizer.encode(
+                    completion.text, add_special_tokens=False
+                )
 
-            train_response_mask = train_tokenized[
-                "response_mask"
-            ]
+                assert encoded_prompt == completion.prompt_ids
+                assert encoded_response == completion.token_ids
+                assert len(completion.old_log_probs) == len(completion.token_ids)
+
+            train_response_mask = padding_mask_matrix(train_completions)
 
             # 将 list[list[float]] 转换成 full-aligned tensor [8, S]。
             train_old_log_probs = completions_to_old_log_probs(
@@ -411,7 +454,7 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 advantage_normalizer = advantage_normalizer, 
                 importance_reweighting_method=offpolicy_variant, 
                 old_log_probs=train_old_log_probs, 
-                clip_range = clip_range, 
+                cliprange = clip_range, 
                 loss_normalization=loss_normalization, 
                 normalization_constant = normalization_constant
             )
@@ -429,17 +472,6 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
 
             step += 1
 
-            if step % 10 == 0:
-                accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
-                policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
-                log_entry.update(
-                    {
-                        "val_reward_total": accuracy, 
-                        "val_reward_format": format_rate, 
-                        "val_response_length": mean_response_length
-                    }
-                )
-
             output_file.write(
                 json.dumps(log_entry, ensure_ascii=False) + "\n"
             )
@@ -454,6 +486,16 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 response_file.flush()
 
         server.sync_policy_weights(policy=policy)
+        if step % 320 == 0:
+            accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
+            policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
+            log_entry.update(
+                {
+                    "val_reward_total": accuracy, 
+                    "val_reward_format": format_rate, 
+                    "val_response_length": mean_response_length
+                }
+            )
                 
 
     server.stop()

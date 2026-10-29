@@ -23,6 +23,7 @@ class VLLMCompletion:
     text: str
     token_ids: list[int]
     finish_reason: str | None
+    prompt_ids: list[int]
     old_log_probs: list[float]
 
 
@@ -214,6 +215,7 @@ def generate_completions(
             VLLMCompletion(
                 text=choice["text"],
                 token_ids=choice.get("token_ids") or [],
+                prompt_ids = choice.get("prompt_token_ids") or [], 
                 old_log_probs=[
                     float(value) for value in choice.get("logprobs").get("token_logprobs")
                 ],
