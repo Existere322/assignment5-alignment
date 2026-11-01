@@ -1,8 +1,8 @@
 import torch
 import json
 from vllm_utils import VLLMServer, VLLMCompletion
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from pathlib import Path
+from transformers import PreTrainedTokenizer
 from checkpoint import get_model_and_tokenizer
 from drgrpo_grader import r1_zero_reward_fn, question_only_reward_fn
 from grpo import grpo_train_step
@@ -17,7 +17,7 @@ current_folder = Path(__file__).resolve().parent
 root_folder = current_folder.parent
 gsm8k_test = Path.joinpath(root_folder, "data/gsm8k/test.jsonl")
 gsm8k_train = Path.joinpath(root_folder, "data/gsm8k/train.jsonl")
-OUTPUT_DIR = current_folder / "exp_results" / "standard_grpo_on_policy"
+OUTPUT_DIR = current_folder / "exp_results" / "standard_grpo_off_policy"
 CHECKPOINTS = current_folder / "model_checkpoints"
 zero_path = Path.joinpath(current_folder, "prompts/r1_zero.prompt")
 question_only_path = Path.joinpath(current_folder, "prompts/question_only.prompt")
@@ -46,7 +46,7 @@ prompt_types = ["r1_zero"]
 
 # off policy params
 Off_policy = True
-gradient_accumulation_steps = 1
+gradient_accumulation_steps = 2
 rollout_batch_size = 256  # 一次推理生成的结果数量
 train_batch_size = 8  # 训练一个 batch 使用的样例数量
 standard_cliprange = 0.2
@@ -195,8 +195,9 @@ def evaluate_process(
 
 
 def padding_mask_matrix(
+    tokenizer: PreTrainedTokenizer, 
     completions: list[VLLMCompletion]
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     sequence_tokens = []
     sequence_masks = []
     for completion in completions:
@@ -217,6 +218,12 @@ def padding_mask_matrix(
     max_length = max(sequence.numel() for sequence in sequence_tokens)
     batch_size = len(sequence_tokens)
 
+    padded_tokens = torch.full(
+        (batch_size, max_length),
+        fill_value=tokenizer.pad_token_id,
+        dtype=torch.long,
+    )
+
     padded_response_mask = torch.zeros(
         (batch_size, max_length),
         dtype=torch.bool,
@@ -226,9 +233,14 @@ def padding_mask_matrix(
         zip(sequence_tokens, sequence_masks)
     ):
         sequence_length = tokens.numel()
+        padded_tokens[index, :sequence_length] = tokens
         padded_response_mask[index, :sequence_length] = mask
 
-    return padded_response_mask[:, 1:]
+    return {
+        "input_ids": padded_tokens[:, :-1],
+        "labels": padded_tokens[:, 1:],
+        "response_mask": padded_response_mask[:, 1:],
+    }
 
 
 def completions_to_old_log_probs(
@@ -404,25 +416,12 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 train_start:train_end
             ]
 
-            # asserting if the tokenizer generate the right result
-            for prompt, completion in zip(train_prompts, train_completions):
-                encoded_prompt = tokenizer.encode(
-                    prompt, add_special_tokens=False
-                )
-                encoded_response = tokenizer.encode(
-                    completion.text, add_special_tokens=False
-                )
-
-                assert encoded_prompt == completion.prompt_ids
-                assert encoded_response == completion.token_ids
-                assert len(completion.old_log_probs) == len(completion.token_ids)
-
-            train_response_mask = padding_mask_matrix(train_completions)
+            tokenized_batch = padding_mask_matrix(tokenizer, train_completions)
 
             # 将 list[list[float]] 转换成 full-aligned tensor [8, S]。
             train_old_log_probs = completions_to_old_log_probs(
                 completions=train_completions,
-                response_mask=train_response_mask,
+                response_mask=tokenized_batch["response_mask"],
                 device=TRAIN_DEVICE,
             )
 
@@ -456,7 +455,8 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 old_log_probs=train_old_log_probs, 
                 cliprange = clip_range, 
                 loss_normalization=loss_normalization, 
-                normalization_constant = normalization_constant
+                normalization_constant = normalization_constant, 
+                tokenized_batch=tokenized_batch
             )
 
             log_entry = {

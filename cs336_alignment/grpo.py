@@ -293,13 +293,17 @@ def grpo_train_step(
     # Loss normalization 
     loss_normalization: Literal["sequence", "constant"] = "sequence",
     normalization_constant: int | None = None,
+    tokenized_batch: dict | None = None
 )-> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
 
-    tokenizer_response = tokenize_prompt_and_output(
-        prompt_strs=repeated_prompts, 
-        output_strs=rollout_responses, 
-        tokenizer=tokenizer, 
-    )
+    if tokenized_batch is None:
+        tokenizer_response = tokenize_prompt_and_output(
+            prompt_strs=repeated_prompts,
+            output_strs=rollout_responses,
+            tokenizer=tokenizer,
+        )
+    else:
+        tokenizer_response = tokenized_batch
 
     rollout_rewards = compute_rollout_rewards(
         reward_fn=reward_fn, 
