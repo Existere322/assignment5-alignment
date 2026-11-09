@@ -46,7 +46,7 @@ prompt_types = ["r1_zero"]
 
 # off policy params
 Off_policy = True
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 4
 rollout_batch_size = 256  # 一次推理生成的结果数量
 train_batch_size = 8  # 训练一个 batch 使用的样例数量
 standard_cliprange = 0.2
@@ -304,7 +304,7 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
 
     set_random_seed(seed)
     
-    run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{prompt_type}_{exp_name[2]}"
+    run_dir = OUTPUT_DIR / f"seed_{seed}_{variant}_{prompt_type}_{exp_name[2]}_{offpolicy_variant}"
     run_dir.mkdir(parents=True, exist_ok=True)
     output_file = open(run_dir / "metrics.jsonl", "w", encoding="utf-8")
     response_file = open(run_dir / "response.jsonl", "w", encoding="utf-8")
@@ -470,6 +470,18 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 "valid_seq_num": step_result[1]["num_valid"]
             }
 
+            if (step + 1) % 320 == 0:
+                server.sync_policy_weights(policy=policy)
+                accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
+                policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
+                log_entry.update(
+                    {
+                        "val_reward_total": accuracy, 
+                        "val_reward_format": format_rate, 
+                        "val_response_length": mean_response_length
+                    }
+                )
+
             step += 1
 
             output_file.write(
@@ -486,16 +498,7 @@ def grpo_traning_process(seed: int, prompt_type: str, variant: str, offpolicy_va
                 response_file.flush()
 
         server.sync_policy_weights(policy=policy)
-        if step % 320 == 0:
-            accuracy, format_rate, mean_response_length = evaluate_process(seed, server, tokenizer, prompt_type)
-            policy.save_pretrained(CHECKPOINTS / f"model_seed_{seed}", safe_serialization=True)
-            log_entry.update(
-                {
-                    "val_reward_total": accuracy, 
-                    "val_reward_format": format_rate, 
-                    "val_response_length": mean_response_length
-                }
-            )
+        
                 
 
     server.stop()
@@ -631,11 +634,13 @@ def plot_training_metrics(
 
 
 def main():
-    SEEDS = [224, 229, 333, 336]
+    # SEEDS = [224, 229, 333, 336]
+    SEEDS = [229, 333, 336]
     TRAINED = False
     all_step_logs = []
     variant_types = ["GRPO_constant", "Dr_GRPO", "RFT", "MaxRL"]  # on policy variants
-    off_policy_variants = ["noclip", "grpo", "gspo"]
+    off_policy_variants = ["gspo"]
+    # off_policy_variants = ["noclip", "grpo", "gspo"]
 
     variant = variant_types[1]
     for offpolicy_variant in off_policy_variants:

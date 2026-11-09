@@ -17,3 +17,7 @@ Higher Learning Rate + r1_zero prompt
 
 Lower Learning Rate + r1_zero prompt
 ![Lower Learning Rate + r1_zero prompt](./result_photos/lr_low.png)
+
+Three Off Policy Method Comparison
+
+![Three Off Policy Method Comparison](cs336_alignment/exp_results/standard_grpo_off_policy/_replot_csv_20261104/01_performance_comparison.png)
